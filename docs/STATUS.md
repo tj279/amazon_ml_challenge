@@ -273,21 +273,57 @@ wall-clock drops from ~60 s → ~10-15 s on an 8 vCPU / 32 GB box.
 
 Same as v2 — 27 features (cheap polars booleans + 10 rapidfuzz ratios). Same per-pair output structure. Already computed inside `block_features.py`. **Nothing to migrate separately** — Phase C v3 run will emit features as it produces candidates.
 
-## Phase E — LightGBM classifier ⏸ pending
+## Phase E — LightGBM classifier 🔄 in progress (NEW pipeline)
 
-**Hardware target**: **32 GiB RAM / 16 cores / 50 GB SSD** (8 GB box CANNOT train).
+**Hardware target**: 8 vCPU / **32 GiB RAM** / 50 GB SSD (8 GB box CANNOT train).
 
-**Hyperparams**:
-- `objective: binary, metric: [binary_logloss, auc], num_leaves: 63, min_data_in_leaf: 1000, learning_rate: 0.05, n_estimators: 1500 (early stop 50), feature_fraction: 0.8, bagging_fraction: 0.8, bagging_freq: 5, lambda_l1: 0.1, lambda_l2: 0.1, scale_pos_weight: DYNAMIC (n_neg/n_pos after sampling), max_bin: 255, bin_construct_sample_cnt: 200_000, n_jobs: -1, seed: 42`.
+**New 7-step pipeline** (replaces the old 3-stage grid + Optuna + final fit):
 
-**Search strategy** (3 ML techniques):
-1. Coarse grid: `num_leaves ∈ {31, 63, 127}` × `learning_rate ∈ {0.03, 0.05, 0.1}` on 20 M-row sample → ~30 min.
-2. Optuna: 30 trials, TPE → ~2 h.
-3. Final fit at best params on 50-80 M rows → ~1.5-2 h.
+1. `prepare_training_data.py` — join blocks + GT, label, group-aware 90/10 split (~5-10 min/dir)
+2. `optuna_search.py` — Optuna TPE, 30 trials, on a 2 M-row stratified subset (~15 min)
+3. `train_scorer.py` — train at Optuna-best params on 10 M rows; score all 93 M (~15 min)
+4. `sample_training.py` — drop rows where `score_p < 0.05` (easy negs) AND `score_p > 0.95 && is_match == 0` (label noise); keep all positives + hard negs (~3-5 min)
+5. `train_final_S2.py` — two-seed (42, 1234) ensemble + snapshot averaging + isotonic calibration on cleaned full S2 (~45 min)
+6. `train_S3.py` — transfer-learn from S2; `init_model=lgbm_S2_seed42.txt`, half `learning_rate` (~30 min)
+7. `threshold.py` — per-(country, source) sweep on calibration-val slice (~5 min/dir)
 
-**Sampling**: all positives (~6.4 M) + 50% random + 50% hard-negatives (mined from quick baseline) at neg:pos 5:1 to 10:1.
+**Total wall-clock: ~1.5-2 h on 8 vCPU / 32 GB.** (vs 6-8 h in the previous 3-stage design.)
 
-**Save**: `artifacts/lgbm_classifier.txt`.
+**Hyperparameters** (canonical — Optuna searches around these in step 2):
+
+```
+objective: binary
+metric: [binary_logloss, auc]
+num_leaves: 63                          # Optuna: 31-255
+min_data_in_leaf: 1000                  # Optuna: 100-5000
+learning_rate: 0.05                     # Optuna: 0.01-0.10 (log)
+n_estimators: 1500-2000                 # with early_stopping_rounds=50 on binary_logloss
+feature_fraction: 0.8                   # Optuna: 0.6-1.0
+bagging_fraction: 0.8                   # Optuna: 0.6-1.0
+bagging_freq: 5                         # Optuna: 1-10
+lambda_l1: 0.1                          # Optuna: 0-5
+lambda_l2: 0.1                          # Optuna: 0-5
+max_bin: 255                            # Optuna: 127-511
+bin_construct_sample_cnt: 200_000
+scale_pos_weight: DYNAMIC               # computed AFTER sampling as n_neg/n_pos
+n_jobs: 8                               # physical cores on this box
+seed: 42                                # + seed 1234 for the second ensemble seed
+```
+
+**Sampling**: 2-stage — (a) train scorer at Optuna-best params on 10 M stratified sample, (b) drop `score_p < 0.05` (easy negs) and `score_p > 0.95 && is_match == 0` (potential label noise). Keep all positives.
+
+**F_0.5 handling**: `binary_logloss` for early stopping (F_0.5 is set-level, not differentiable — see Hard-fail bug #9 below). Threshold sweep INSIDE each Optuna trial so Optuna optimizes the actual metric. Per-(country, source) thresholds sweep at end on calibration-val slice.
+
+**Outputs**:
+- `artifacts/lgbm_S{2,3}_seed{42,1234}.txt` — two models per direction, averaged at inference
+- `artifacts/calibrator_S{2,3}.joblib` — isotonic calibration on 1% val slice
+- `artifacts/per_country_source_threshold_S{2,3}.json` — final thresholds
+- `artifacts/best_params_S{2,3}.json` — Optuna-best params
+- `artifacts/optuna_trials.parquet` — full trial history (atomic append; supports `--resume`)
+- `artifacts/sampled_training_S{2,3}.parquet` — cleaned training data
+- `artifacts/scores_S{2,3}.parquet` — full-dataset probabilities from scorer
+
+**No `singleton_detector.py`**: the per-(country, source) threshold sweep already handles singletons via the set-level F_0.5 contract (`f05_single` returns 1.0 if pred empty else 0.0). A separate detector would just retrain what the threshold sweep already encodes.
 
 ## Phase F — inference ⏸ pending
 
@@ -341,3 +377,9 @@ These come up because the previous sessions iterated fast:
 7. **Hard-threshold QUALITY filter is OR not AND**: a candidate is kept if it passes **at least one** of the four floors. Do NOT make it AND — that would lose pairs strong on one axis but weak on others.
 
 8. **structural contribution is capped at min(n_struct_keys, 3) / 3** — not /8.0. Because city/state/country trivially match (always same-country, often same-state, often same-city), so even matching all 3 of them should contribute at most 1.0, not 3/8=0.375.
+
+9. **F_0.5 is set-level and not differentiable** — `src/f05.py::f05_single(pred_set, true_set)` operates on a SET of predicted IDs, not per-row. **Never** use macro F_0.5 as a LightGBM early-stopping metric. Use `binary_logloss` (or `auc`) for per-tree early stopping; sweep per-(country, source) thresholds at the post-train / per-Optuna-trial stage instead. This is also why the Optuna objective runs the threshold sweep INSIDE each trial — so Optuna optimizes the actual evaluation metric, not a proxy.
+
+10. **`scale_pos_weight` MUST be computed AFTER sampling** — if you compute it on the pre-sample class distribution, the boost multiplier is wrong (way too high) and LightGBM over-emphasizes the negative class in a way that hurts F_0.5 (which is precision-weighted). The pattern: `n_neg_after, n_pos_after = sample_df.select([(pl.col("is_match") == 0).sum(), (pl.col("is_match") == 1).sum()]).row(0); spw = n_neg_after / max(1, n_pos_after)`.
+
+11. **Hard-negative mining uses an Optuna-tuned scorer, not a fixed 50-tree baseline** — the old "quick baseline" approach used arbitrary fixed hyperparameters and gave mediocre P-ranking. The current pipeline's `train_scorer.py` uses Optuna-best params (already paid for in step 2), giving a much better hard-negative signal for the same compute budget.

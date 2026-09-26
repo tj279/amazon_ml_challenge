@@ -2,6 +2,9 @@
 
 Usage:
     python scripts/combine_block_features.py
+
+NOTE: optional for Phase E (per-direction training); required for Phase F if you
+want a single combined feature parquet instead of two per-direction files.
 """
 from __future__ import annotations
 

@@ -22,12 +22,14 @@ Full problem statement: `data_set/student_resource/README.md` (canonical) and `p
 | B — normalization (libpostal `parse_address`) | ✅ done | `code/business_entity_resolution/artifacts/s{1,2,3}_norm_train.parquet` (~1.3 GB total) |
 | **C — blocking (v3 design locked-in, S2 ran with v2)** | 🔄 **v2 S2 produced; rebuilding with v3** | v2 output: `artifacts/block_S2_features.parquet` (1.55 GB). v3 will overwrite. |
 | **D — feature engineering** | ✅ done | 27 features per candidate pair |
-| E — LightGBM classifier + singleton detector | ⏸ pending | needs Phase C v3 done (recall must be ≥ 0.80 before training) |
+| **E — LightGBM classifier (small-Optuna → scoring → final pipeline)** | 🔄 **in progress** (new architecture) | `artifacts/lgbm_S{2,3}_seed{42,1234}.txt`, `artifacts/per_country_source_threshold_S{2,3}.json`, `artifacts/calibrator_S{2,3}.joblib` |
 | F — inference + threshold | ⏸ pending | depends on Phase E |
 | G — graph refinement | ⏸ pending | depends on Phase F |
 | H — packaging (submission zip) | ⏸ pending | depends on Phase G |
 
 **v3 blocker design — REPLACE the current `block_features.py`.** The v2 blocker (8 cheap structural keys + char-trigram inverted index) hit only **20.4% mean recall** on the train ground truth (median 0%; 50.7% of S1 entities had ZERO true matches recalled). v3 fix is locked-in — see `docs/STATUS.md` §Phase C v3 and the comments in `scripts/block_features.py`.
+
+**Phase E pipeline is on a different architecture than the old "3-stage grid + Optuna + final fit" plan.** The current design (see `docs/STATUS.md` §Phase E and `docs/RUNBOOK.md` §5) is a 7-step pipeline: **small-model Optuna → scoring model → hard-negative-mined final fit → transfer-learn S2→S3**. Wall-clock target: **1.5–2 h** on 8 vCPU / 32 GB (down from 6–8 h in the previous design). The old `train_classifier.py` + `singleton_detector.py` scripts referenced in §5 of the runbook are no longer planned — the new pipeline uses `prepare_training_data.py`, `optuna_search.py`, `train_scorer.py`, `sample_training.py`, `train_final_S2.py`, `train_S3.py`, `threshold.py`.
 
 **Hard constraint recap (from user feedback)**:
 1. Country always same — hard pre-filter before any candidate survives.
@@ -44,22 +46,24 @@ Full problem statement: `data_set/student_resource/README.md` (canonical) and `p
 3. **Skim** `~/.claude/plans/deep-gliding-wombat.md` — full v3 plan with weights/ thresholds/ floors.
 4. **Check** Phase C state: `ls code/business_entity_resolution/artifacts/`
    - If `s{1,2,3}_norm_train.parquet` exist but no `block_*_features.parquet` exist → run Phase C v3.
-   - If `block_S{2,3}_features.parquet` both exist → proceed to Phase E.
+   - If `block_S{2,3}_features.parquet` both exist → proceed to Phase E (per RUNBOOK.md §5).
    - **NOTE**: v2 S2 ran but produced 20% recall; v3 will overwrite it.
+5. **Phase E pipeline** (when blockers done): see RUNBOOK.md §5 for the seven-command sequence. Wall-clock target 1.5–2 h. Key gotchas: `scale_pos_weight` must be computed AFTER sampling; F_0.5 is set-level (use `binary_logloss` for early stopping).
 
 ## Compute realities — confirmed working sizes
 
 | Stage | Min CPU | Min RAM | Disk | Wall-clock |
 | --- | --- | --- | --- | --- |
 | v3 blocking (S2 or S3) | 2 vCPU | **8 GiB** | 30 GB | ~30-50 min / direction on 2 vCPU; ~20-30 min on 4 vCPU |
-| Phase E (LightGBM training) | 8 cores | 32 GiB | 50 GB | 3-5 h |
+| Phase E (LightGBM training) | 8 cores | 32 GiB | 50 GB | **1.5–2 h** (small-Optuna → scoring → final pipeline) |
 | Phase F (test inference) | same as Phase C v3 | same | +1.5 GB output | 5-10 min (after test blocker cached) |
 
 - **v3 blocking fits in 8 GB RAM**, peak ~2.5 GB. **AWS t3.medium (2 vCPU / 8 GiB)** works — expect ~50-80 min for one direction.
-- **Phase E training needs ≥32 GiB RAM** (LightGBM histogram). Don't try to train on AWS t3.medium.
+- **Phase E training needs ≥32 GiB RAM** (LightGBM histogram). Don't try to train on AWS t3.medium. Wall-clock on this box (8 vCPU / 32 GB) is **1.5–2 h** with the new small-Optuna → scoring → final pipeline (see STATUS.md §Phase E).
 - **No GPU needed** — CPU-only stack.
 - **Test blocker caching**: Phase F writes `block_S{2,3}_TEST_features.parquet` once (~50 min); every subsequent model iteration on test data is then 5-10 min (load + predict only).
 - **Detached execution** for any stage > 5 min: `setsid nohup bash -c "..." > /tmp/<stage>.log 2>&1 &` so Claude session timeouts don't kill the job.
+- **Optuna crash recovery**: `optuna_search.py` appends every trial atomically to `artifacts/optuna_trials.parquet`; restart with `--resume` rehydrates the study.
 - **Source-of-truth data:** train files only during development. Test files touched only at Phase H.
 
 ## Code layout
@@ -70,14 +74,26 @@ amzn_ml/
 │                                 # TEST files are in dataset/test/ — DO NOT READ during dev
 ├── code/business_entity_resolution/     # the package
 │   ├── src/                    # pipeline code (one module per phase)
-│   │   ├── config.py          # paths + hyper-params (TRAIN_ONLY = True)
+│   │   ├── config.py          # paths + hyper-params (TRAIN_ONLY = True; LightGBMParams is canonical)
 │   │   ├── io_utils.py        # polars TSV/parquet loaders
-│   │   ├── f05.py             # macro F_0.5 scorer
+│   │   ├── f05.py             # macro F_0.5 scorer (set-level — use binary_logloss for early stop)
 │   │   ├── eda.py             # EDA (already executed, CSVs in artifacts/)
 │   │   ├── normalize.py       # libpostal parse_address; (B done)
 │   │   ├── transliterate.py   # Devanagari ↔ Latin (utility used by normalize)
 │   │   ├── blocking.py        # ⏸ resume here; sequential-by-stage build pattern
 │   │   └── validate_blocking.py  # recall validation for Phase C
+│   ├── scripts/               # driver scripts (one per stage; see RUNBOOK.md)
+│   │   ├── block_features.py          # Phase C v3 + D: blocker + 40-feature extraction
+│   │   ├── combine_block_features.py  # Phase C2: combine S2+S3 parquets (optional for E; needed for F)
+│   │   ├── validate_block_recall.py   # recall validator (Phase C2)
+│   │   ├── prepare_training_data.py   # Phase E1: label + group-aware 90/10 split (NEW)
+│   │   ├── optuna_search.py           # Phase E2: small-model Optuna TPE 30 trials (NEW)
+│   │   ├── train_scorer.py            # Phase E3: full-data scoring at best params (NEW)
+│   │   ├── sample_training.py         # Phase E4: hard-neg filter P<0.05 / P>0.95 (NEW)
+│   │   ├── train_final_S2.py          # Phase E5: two-seed + snapshot + calibrator (NEW)
+│   │   ├── train_S3.py                # Phase E6: S2→S3 transfer-learn (NEW)
+│   │   ├── threshold.py               # Phase E7: per-(country, source) sweep (NEW)
+│   │   └── ... (analyze_*, validate_* EDA)
 │   ├── artifacts/             # phase outputs (parquets, reports)
 │   ├── docs/phase_c_blocking.md  # methodology rationale for the 12 blocking keys
 │   ├── requirements.txt
@@ -92,15 +108,16 @@ amzn_ml/
 `~/.claude/projects/.../memory/` carries session-spanning facts:
 - `amzn-ml-challenge-overview.md` — problem summary
 - `train-only-dev-policy.md` — never read test files in dev
-- `new-hardware-phase-c-handoff.md` — what's done, what failed, where to resume
+- `phase-e-training-pipeline.md` — the new 7-step Phase E pipeline (small-Optuna → scoring → final)
 
 ## Conventions (across every phase)
 
 1. **RAM-aware workers** — auto-cap from `/proc/meminfo`; n_workers = clamp(int((free_gb - 6.0) / 1.5), 1, 4).
-2. **Detached runners** — `setsid nohup bash -c "..." > /tmp/<stage>.log 2>&1; touch /tmp/<stage>.done`.
-3. **Resumability** — each stage's driver checks `if output_path.exists(): skip`.
+2. **Detached runners** — `setsid nohup bash -c "..." > /tmp/<stage>.log 2>&1; touch /tmp/<stage>.done`. Phase E in particular: each step writes a `.done` flag and the next step skips if found.
+3. **Resumability** — each stage's driver checks `if output_path.exists(): skip`. Optuna specifically persists every trial atomically to `artifacts/optuna_trials.parquet`; restart with `--resume`.
 4. **Train-only** — never read `dataset/test/*`; only at Phase H inference.
-5. **Env** — `source /home/rujul/local/setup_env.sh` before any Python run.
+5. **Env** — activate the project venv (`source .venv/bin/activate`) before any Python run; the Python version and packages are pinned in `code/business_entity_resolution/requirements.txt`.
+6. **F_0.5 is set-level** — never use it as a per-tree early-stopping metric; use `binary_logloss`. Threshold sweep runs at the post-train / per-Optuna-trial stage instead.
 
 ## Why CPU-bound (and why the GPU is useless here)
 
@@ -114,9 +131,9 @@ This stack has **no neural networks, no embedding models, no GPU-targeted librar
 | datasketch MinHash / MinHashLSH | shingle hashing + LSH bandit | CPU only |
 | rapidfuzz QRatio / Levenshtein | char-level edit-distance | CPU only |
 | polars dataframe operations | filter / group / join | CPU + native SIMD |
-| Phase E: LightGBM classifier | histogram splits, GBDT | CPU (`n_jobs=18`) |
+| Phase E: LightGBM classifier | histogram splits, GBDT | CPU (`n_jobs=8` on this box) |
 
-Each is a multi-threaded C/Cython/Rust library that already saturates ≥16 cores on its dataset size. LightGBM at `n_jobs=18` on 16 GB RAM uses ~1.2 GB peak with sparse-binning. Adding GPU support to any of these either:
+Each is a multi-threaded C/Cython/Rust library that already saturates ≥16 cores on its dataset size. LightGBM at `n_jobs=8` (this box's physical cores) on 32 GB RAM uses ~3 GB peak with histogram binning. Adding GPU support to any of these either:
 
 - **Doesn't exist** (libpostal, datasketch have no CUDA paths),
 - **Doesn't apply** (sklearn HashingVectorizer has no GPU fork),
